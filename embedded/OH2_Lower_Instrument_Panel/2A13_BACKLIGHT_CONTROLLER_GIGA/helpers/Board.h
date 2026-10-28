@@ -1,0 +1,464 @@
+/**********************************************************************************************************************
+ *        ____                   _    _                       _
+ *       / __ \                 | |  | |                     | |
+ *      | |  | |_ __   ___ _ __ | |__| | ___  _ __ _ __   ___| |_
+ *      | |  | | '_ \ / _ \ '_ \|  __  |/ _ \| '__| '_ \ / _ \ __|
+ *      | |__| | |_) |  __/ | | | |  | | (_) | |  | | | |  __/ |_
+ *       \____/| .__/ \___|_| |_|_|  |_|\___/|_|  |_| |_|\___|\__|
+ *             | |
+ *             |_|
+ *   ----------------------------------------------------------------------------------
+ *  
+ * @file      Board.h
+ * @author    Ulukaii
+ * @date      18.Jul 2026
+ * @version   t 0.3.5
+ * @copyright Copyright 2016-2025 OpenHornet. See 2A13_BACKLIGHT_CONTROLLER_GIGA.ino for details.
+ * @brief     The board class is responsible for the physical input/output: catch rotary encoder commands, update LEDs.
+ * @details   During setup, a singleton board object is created. It manages the physical update of the LEDs centrally.
+ *            It is the only place from which the expensive physical update (FastLED.show() function) is called.
+ *            Additionally, it provides the logic to catch rotary encoder commands to cycle between three modes:
+ *            - Normal mode 1 (DCS-BIOS controlled)
+ *            - Manual mode 2(control backlights with rotary encoder)
+ *            - Rainbow test mode 3
+ *********************************************************************************************************************/
+
+
+
+#ifndef __BOARD_H
+#define __BOARD_H
+
+#define DCSBIOS_DEFAULT_SERIAL
+
+#include "FastLED.h"
+#include "Channel.h"
+#include "DcsBios.h"
+#include "GigaUsbNoDtr.h"
+#include "GigaDma1Port.h"
+#include "GigaStatusLed.h"
+#include "Colors.h"
+#include "LedUpdateState.h"
+#include "RotaryEncoder.h"
+#include "DCS_State_Checker.h"
+
+class Board {
+
+private:
+
+    static const int MAX_CHANNELS = 10;                               // Maximum number of channels
+    static const int MODE_NORMAL = 1;                                 // Normal DCS-BIOS controlled mode
+    static const int MODE_MANUAL = 2;                                 // Manual mode - control backlts with rotary encoder
+    static const int MODE_RAINBOW = 3;                                // Rainbow test mode
+    Channel* channels[MAX_CHANNELS];                                  // Array of channel pointers
+    int channelCount;                                                 // Current number of channels
+    int thisHue;                                                      // Current hue value for rainbow effect
+    int deltaHue;                                                     // Hue change between LEDs for rainbow effect
+    int currentMode;                                                  // Current operating mode
+    int mode2_brightness;                                             // Current brightness level (0-255), for manual mode 2
+    int mode3_brightness;                                             // Brightness level (0-255) for rainbow mode 3
+    uint16_t dcs_brightness_console;                                   // Current brightness level (0-65535), for DCS-BIOS controlled mode
+    uint16_t dcs_brightness_instrument;                                // Current brightness level (0-65535), for DCS-BIOS controlled mode
+    uint16_t dcs_brightness_flood;                                     // Current brightness level (0-65535), for DCS-BIOS controlled mode
+    int encSwPin;                                                     // Encoder switch pin
+    RotaryEncoder* encoder;                                           // Pointer to encoder instance
+    int rotary_pos;                                                   // Current rotary encoder position
+    static Board* instance;                                           // Static instance pointer to the Board class
+    DcsState prevDcsState = DcsState::EXITED;                         // Previous DCS state for transition detection
+    
+    /**
+     * @brief Private constructor to enforce singleton pattern
+     * @see This method is called by getInstance() when creating the singleton instance
+     */
+    Board() {
+        channelCount = 0;                                             // Initialize with 0 channels
+        thisHue = 0;                                                  // Initialize with 0
+        deltaHue = 2;                                                 // Initialize with 2
+        currentMode = MODE_NORMAL;                                    // Initialize to normal mode 1
+        mode2_brightness = 64;                                        // Initialize manual mode 2 brightness to 25%
+        mode3_brightness = 64;                                        // Initialize rainbow mode 3 brightness to 25%
+        dcs_brightness_console = 0;                                   // Initialize DCS brightness to 0
+        dcs_brightness_instrument = 0;                                // Initialize DCS brightness to 0
+        dcs_brightness_flood = 0;                                     // Initialize DCS brightness to 0
+        rotary_pos = 0;                                               // Initialize with 0
+        encoder = nullptr;                                            // Initialize with nullptr
+    }
+
+    /**
+     * @brief Computes scaled CRGB targets for instrument backlights and pushes them to all channels.
+     *        Uses the cached dcs_brightness_instrument value. No gating - always applies.
+     * @see Called by updateInstrumentLights() (after gate) and from mode-entry / DCS-resume paths
+     *      that need to force-push the cached value regardless of whether it changed.
+     */
+    void applyInstrumentTargets() {
+        uint8_t scale = map(dcs_brightness_instrument, 0, 65535, 0, 255);
+        CRGB instrTarget = NVIS_GREEN_A;       instrTarget.nscale8_video(scale);
+        CRGB cgrbTarget  = NVIS_CGRB_GREEN_A;  cgrbTarget.nscale8_video(scale);
+        for (int i = 0; i < channelCount; i++) {
+            channels[i]->applyInstrLights(instrTarget, cgrbTarget);
+        }
+        LedUpdateState::getInstance()->setUpdateFlag(true);
+    }
+
+    /**
+     * @brief Computes scaled CRGB target for console backlights and pushes it to all channels.
+     *        Uses the cached dcs_brightness_console value. No gating - always applies.
+     */
+    void applyConsoleTargets() {
+        uint8_t scale = map(dcs_brightness_console, 0, 65535, 0, 255);
+        CRGB consoleTarget = NVIS_GREEN_A;     consoleTarget.nscale8_video(scale);
+        for (int i = 0; i < channelCount; i++) {
+            channels[i]->applyConsoleLights(consoleTarget);
+        }
+        LedUpdateState::getInstance()->setUpdateFlag(true);
+    }
+
+    /**
+     * @brief Computes scaled CRGB target for floodlights and pushes it to all channels.
+     *        Uses the cached dcs_brightness_flood value. No gating - always applies.
+     */
+    void applyFloodTargets() {
+        uint8_t scale = map(dcs_brightness_flood, 0, 65535, 0, 255);
+        CRGB floodTarget = NVIS_WHITE;         floodTarget.nscale8_video(scale);
+        for (int i = 0; i < channelCount; i++) {
+            channels[i]->applyFloodlights(floodTarget);
+        }
+        LedUpdateState::getInstance()->setUpdateFlag(true);
+    }
+
+
+public:
+
+    /**
+     * @brief Gets or createsthe singleton instance of the Board class
+     * @see This method is called by setup() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    static Board* getInstance() {
+        return instance ? instance : (instance = new Board()); }
+
+    /**
+     * @brief Sets up the rotary encoder with switch and encoder pins
+     * @param encSwPin Pin number for the encoder switch
+     * @param encAPin Pin number for encoder A
+     * @param encBPin Pin number for encoder B
+     * @see This method is called by setup() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    void setupRotaryEncoder(int encSwPin, int encAPin, int encBPin) {
+        this->encSwPin = encSwPin;
+        pinMode(encSwPin, INPUT_PULLUP);                              // Initialize mode change pin
+        encoder = new RotaryEncoder(encAPin, encBPin, RotaryEncoder::LatchMode::TWO03);
+    }
+
+
+    /**
+     * @brief Registers a channel with the board
+     * @param channel Pointer to the channel to register
+     * @see This method is called by setup() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    void registerChannel(Channel* channel) {
+        channels[channelCount++] = channel;
+    }
+
+    /**
+     * @brief Update the physical LED state
+     * @details FastLED.show() copies the scaled GRB bytes of every channel into buffers (a few ms, interrupts stay ON).
+     *          giga_dma::commit() then builds the data words of the whole frame (about 0.7 ms) and starts the DMA, which sends
+     *          all ten channels together by itself (about 11 ms for the longest strip). The M7 keeps listening to DCS-BIOS
+     *          the whole time; there is no deaf window. If the previous frame is still going, the update flag stays set and
+     *          the update is retried on the next pass, so changes that arrive meanwhile merge into the next frame.
+     * @see This method is called by loop() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    void updateLeds() {
+        // resend the full LED frame once a second even if nothing changed. If a frame is ever
+        // received misaligned, the next refresh corrects it.
+        static unsigned long lastRefreshMs = 0;
+        if (millis() - lastRefreshMs >= 1000) {
+            lastRefreshMs = millis();
+            LedUpdateState::getInstance()->setUpdateFlag(true);
+        }
+        if (!LedUpdateState::getInstance()->getUpdateFlag()) return;  // Nothing changed: no update needed
+        if (!giga_dma::ready()) return;                               // Previous frame still going: retry next pass
+        FastLED.show();
+        giga_dma::commit();
+        LedUpdateState::getInstance()->setUpdateFlag(false);
+    }
+
+
+    /**
+     * @brief Handles mode change button press and returns current mode
+     * @return The current mode after handling the button press
+     * @see This method is called by loop() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    int handleModeChange() {
+        static bool lastButtonState = HIGH;
+        static unsigned long lastButtonPressTime = 0;
+        const unsigned long BUTTON_WAIT = 1000;                       // Wait time in milliseconds between button presses
+        
+        bool currentButtonState = digitalRead(encSwPin);              // Read the state of the encoder switch
+        unsigned long currentTime = millis();                          // Get current time in milliseconds
+        
+        if (currentButtonState == LOW && lastButtonState == HIGH) {   // Button has just been pressed
+            if (currentTime - lastButtonPressTime < BUTTON_WAIT) {    // Only process if 1 sec passed since last press
+                lastButtonState = currentButtonState;
+                return currentMode;
+            }
+            lastButtonPressTime = currentTime;                        // Update last press time
+            int previousMode = currentMode;                           // Store previous mode
+            currentMode = (currentMode % 3) + 1;                      // Cycle to next mode
+            
+            if (currentMode == MODE_NORMAL) {
+                setAllLightsOff();
+                // Force-restore the cached brightness directly (bypasses central gate).
+                // The DCS-BIOS messages below also keep the sim in sync, but we no longer
+                // rely on their echo to repaint our LEDs.
+                applyInstrumentTargets();
+                applyConsoleTargets();
+                applyFloodTargets();
+                sendDcsBiosMessage("CONSOLES_DIMMER", String(dcs_brightness_console).c_str());           // Send DCS-BIOS message to reset console dimmer
+                sendDcsBiosMessage("INST_PNL_DIMMER", String(dcs_brightness_instrument).c_str());        // Send DCS-BIOS message to reset instrument lighting
+                sendDcsBiosMessage("FLOOD_DIMMER", String(dcs_brightness_flood).c_str());                  // Send DCS-BIOS message to reset floodlights dimmer
+            }
+            if (currentMode == MODE_MANUAL) {
+                mode2_brightness = 64;                                // Reset to 25% brightness
+                fillSolid(NVIS_GREEN_A);                              // Apply the brightness immediately
+            }
+            if (currentMode == MODE_RAINBOW) {
+                mode3_brightness = 64;                                // Reset to 25% brightness
+                encoder->tick();                                      // Update encoder state
+                rotary_pos = encoder->getPosition();                  // Sync encoder position to avoid false change detection
+                setAllLightsOff();                                    // Clear any previous state
+            }
+
+            lastButtonState = currentButtonState;
+            delay(10);                                                // Small delay to debounce switch
+        } else {
+            lastButtonState = currentButtonState;
+        }
+        return currentMode;
+    }
+
+    /**
+     * @brief Processes the current mode
+     * @see This method is called by loop() in 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+     */
+    void processMode() {
+        int newPos = 0;  
+        giga_status::service(currentMode == MODE_NORMAL);             // GIGA status light: green = DCS data, flashing blue = none
+        switch(currentMode) {
+            case MODE_NORMAL:                                         // MODE 1: LEDs controlled by DCS BIOS
+                {
+                    DcsState currentDcsState = getDcsState();
+                    if (currentDcsState == DcsState::EXITED && prevDcsState != DcsState::EXITED) {
+                        setAllLightsOff();                            // DCS just exited: turn off all lights
+                    } else if (prevDcsState == DcsState::EXITED &&
+                               currentDcsState != DcsState::EXITED &&
+                               currentDcsState != DcsState::PAUSED) {
+                        // DCS became active again: force-push the cached brightness
+                        // (helpers bypass the central gate, which would otherwise short-circuit)
+                        applyInstrumentTargets();
+                        applyConsoleTargets();
+                        applyFloodTargets();
+                    }
+                    // PAUSED: do nothing - keep current light state
+                    prevDcsState = currentDcsState;
+                    gigaUsbNoDtrPoll();                               // GIGA: accept DCS-BIOS data with DTR off
+                    giga_status::pollRx();                            // GIGA status light: note that DCS-BIOS bytes are arriving
+                    DcsBios::loop();
+                }
+                break;
+            case MODE_MANUAL:                                         // MODE 2: LEDs controlled manually through BKLT switch
+                encoder->tick();
+                newPos = encoder->getPosition();
+                if (newPos != rotary_pos) {
+                    RotaryEncoder::Direction direction = encoder->getDirection();
+                    if (direction == RotaryEncoder::Direction::CLOCKWISE) {
+                        mode2_brightness = (mode2_brightness < 224) ? mode2_brightness + 32 : 255;  // Add 32 or cap at 255
+                    } else {
+                        mode2_brightness = (mode2_brightness > 32) ? mode2_brightness - 32 : 0;  // Subtract 32 or cap at 0
+                    }
+                    rotary_pos = newPos;
+                    fillSolid(NVIS_GREEN_A);                          
+                }
+                break;   
+            case MODE_RAINBOW:                                        // MODE 3: Rainbow test mode
+                encoder->tick();
+                newPos = encoder->getPosition();
+                if (newPos != rotary_pos) {
+                    RotaryEncoder::Direction direction = encoder->getDirection();
+                    if (direction == RotaryEncoder::Direction::CLOCKWISE) {
+                        mode3_brightness = (mode3_brightness < 224) ? mode3_brightness + 32 : 255;  // Add 32 or cap at 255
+                    } else {
+                        mode3_brightness = (mode3_brightness > 32) ? mode3_brightness - 32 : 0;  // Subtract 32 or cap at 0
+                    }
+                    rotary_pos = newPos;
+                }
+                for (int i = 0; i < channelCount; i++) {
+                    fill_rainbow(channels[i]->getLeds(), channels[i]->getLedCount(), thisHue, deltaHue);
+                    // Scale down brightness to reduce maximum brightness
+                    nscale8_video(channels[i]->getLeds(), channels[i]->getLedCount(), mode3_brightness);
+                }
+                thisHue++;  // Increment the hue for the next frame
+                LedUpdateState::getInstance()->setUpdateFlag(true);
+                break;
+        }
+    }
+
+
+    /**
+     * @brief Fills all channels with a solid color (used by MODE_MANUAL)
+     * @param color The color to fill instrument and console backlights with
+     * @param brightness Optional brightness value (0-255). If not provided, uses mode2_brightness.
+     * @details The CGRB instrument LEDs (e.g. radar altimeter) always render as NVIS_CGRB_GREEN_A
+     *          scaled by the same brightness, matching the original behavior.
+     * @see This method is called by handleModeChange() and processMode() in Board.h, conditionally in MODE_MANUAL case
+     */
+    void fillSolid(const CRGB& color, int brightness = -1) {
+        uint8_t scale = (uint8_t)((brightness >= 0) ? brightness : this->mode2_brightness);
+        CRGB instrTarget   = color;              instrTarget.nscale8_video(scale);
+        CRGB cgrbTarget    = NVIS_CGRB_GREEN_A;  cgrbTarget.nscale8_video(scale);
+        CRGB consoleTarget = color;              consoleTarget.nscale8_video(scale);
+        for (int i = 0; i < channelCount; i++) {
+            channels[i]->applyInstrLights(instrTarget, cgrbTarget);
+            channels[i]->applyConsoleLights(consoleTarget);
+        }
+        LedUpdateState::getInstance()->setUpdateFlag(true);
+    }
+
+    /**
+     * @brief Turns off all lights in all channels and resets brightness state
+     * @see This method is called by handleModeChange() in Board.h
+     */
+    void setAllLightsOff() {                                         // Turn off all lights and reset brightness state
+        for (int i = 0; i < channelCount; i++) {
+            channels[i]->setAllLightsOff();
+        }
+        LedUpdateState::getInstance()->setUpdateFlag(true);
+    }
+
+    /**
+     * @brief Updates all channels with new instrument lighting value
+     * @param newValue The new brightness value
+     * @see This method is conditionally called by onInstrIntLtChange() in Board.h
+     */
+    void updateInstrumentLights(uint16_t newValue) {
+        if (newValue == dcs_brightness_instrument) return;            // Central gate: skip if unchanged
+        dcs_brightness_instrument = newValue;                         // In any mode, store the DCS-BIOS brightness value
+        if (currentMode != MODE_NORMAL) return;                       // But only in normal mode, actually send update to channels
+        applyInstrumentTargets();
+    }
+
+    /**
+     * @brief Updates all channels with new console lighting value
+     * @param newValue The new brightness value
+     * @see This method is called by onConsolesDimmerChange() in Board.h
+     */
+    void updateConsoleLights(uint16_t newValue) {
+        if (newValue == dcs_brightness_console) return;               // Central gate: skip if unchanged
+        dcs_brightness_console = newValue;                            // In any mode, store the DCS-BIOS brightness value
+        if (currentMode != MODE_NORMAL) return;                       // But only in normal mode, actually send update to channels
+        applyConsoleTargets();
+    }
+
+    /**
+     * @brief Updates all channels with new flood lighting value
+     * @param newValue The new brightness value
+     * @see This method is called by onFloodDimmerChange() in Board.h
+     */
+    void updateFloodLights(uint16_t newValue) {
+        if (newValue == dcs_brightness_flood) return;                 // Central gate: skip if unchanged
+        dcs_brightness_flood = newValue;                              // In any mode, store the DCS-BIOS brightness value
+        if (currentMode != MODE_NORMAL) return;                       // But only in normal mode, actually send update to channels
+        applyFloodTargets();
+    }
+
+
+    /**
+     * @brief Callback for instrument lighting changes from DCS-BIOS
+     * @param newValue The new brightness value from DCS-BIOS
+     * @see This method is called by DCS-BIOS when instrument lighting changes
+     */
+    static void onInstrIntLtChange(unsigned int newValue) {
+        if (instance) instance->updateInstrumentLights(newValue);
+    }
+    DcsBios::IntegerBuffer instrIntLtBuffer{FA_18C_hornet_INSTR_INT_LT, onInstrIntLtChange};
+
+    /**
+     * @brief Callback for console dimmer changes from DCS-BIOS
+     * @param newValue The new brightness value from DCS-BIOS
+     * @see This method is called by DCS-BIOS when console dimmer changes
+     */
+    static void onConsolesDimmerChange(unsigned int newValue) {
+        if (instance) instance->updateConsoleLights(newValue);
+    }
+    DcsBios::IntegerBuffer consolesDimmerBuffer{FA_18C_hornet_CONSOLES_DIMMER, onConsolesDimmerChange};
+
+    /**
+     * @brief Callback for flood lighting changes from DCS-BIOS
+     * @param newValue The new brightness value from DCS-BIOS
+     * @see This method is called by DCS-BIOS when flood lighting changes
+     */
+    static void onFloodDimmerChange(unsigned int newValue) {
+        if (instance) instance->updateFloodLights(newValue);
+    }
+    DcsBios::IntegerBuffer floodDimmerBuffer{FA_18C_hornet_FLOOD_DIMMER, onFloodDimmerChange};
+
+};
+
+
+
+
+// Initialize static instance pointer
+Board* Board::instance = nullptr;
+
+#endif 
+
+
+
+
+
+    // TODO: the following lines contain code snippets for the future PREFLT mode that is not yet implemented
+
+    //    static void onAcftNameChange(char* newValue) {
+    //    if (!strcmp(newValue, "FA-18C_hornet")) {
+    //        //cl_F18C.MakeCurrent();
+    //    }
+    //}
+
+    // DCS-BIOS callbacks and buffers
+    //static void onAcftNameChange(char* newValue) {
+    //    if (!strcmp(newValue, "FA-18C_hornet")) {
+    //        //cl_F18C.MakeCurrent();
+    //    }
+    //}
+    //DcsBios::StringBuffer<16> AcftNameBuffer{0x0000, onAcftNameChange};
+
+    /*
+            // This is the recommended approach and the ideal if we can work out all the kinks:
+        // If the mission time changes backwards, we have entered a new aircraft; Resync everything
+
+        unsigned long uLastModelTimeS = 0xFFFFFFFF; // Start big, to ensure the first step triggers a resync
+
+        void onModTimeChange(char* newValue) {
+        unsigned long currentModelTimeS = atol(newValue);
+
+        if( currentModelTimeS < uLastModelTimeS )
+        {
+            if( currentModelTimeS > 20 )// Delay to give time for DCS to finish loading and become stable and responsive
+            {
+            DcsBios::resetAllStates();
+            uLastModelTimeS = currentModelTimeS;
+            }
+        }
+        else
+        {
+            uLastModelTimeS = currentModelTimeS;
+        }
+        }
+        DcsBios::StringBuffer<5> modTimeBuffer(0x043e, onModTimeChange);
+
+        // Also we can check on weight on wheels change:
+        void onExtWowLeftChange(unsigned int newValue) {
+            // your code here 
+        }
+        DcsBios::IntegerBuffer extWowLeftBuffer(FA_18C_hornet_EXT_WOW_LEFT, onExtWowLeftChange);
+        
+    */

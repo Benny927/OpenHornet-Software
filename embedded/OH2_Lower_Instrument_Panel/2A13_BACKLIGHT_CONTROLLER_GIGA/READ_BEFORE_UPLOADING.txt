@@ -1,0 +1,51 @@
+READ BEFORE UPLOADING - Giga backlight controller, V 1.0.0 (single processor, DMA LED output)
+==========================================================================================================
+This is the tested V 1.1.0 build with ONLY the pins changed for the modified PR 1292 shield (rev 2.0.0 with six channel nets moved
+so that all ten channels are on GPIO port J). The DMA engine (helpers/DmaOut1.h) is byte-for-byte the one that ran on a Giga on
+27 Oct. The only code change besides the .ino pins: D22 (PJ12) is now accepted as a channel pin in helpers/GigaDma1Port.h.
+One sketch on the M7 core: no M4 sketch, no RPC. In-house only; the board is still a draft.
+
+BEFORE YOU START
+  - Arduino IDE with the "Arduino Mbed OS Giga Boards" core installed; libraries FastLED 3.10.8 and DCS-BIOS
+  - USB cable in the GIGA's USB-C port; Tools > Board: Arduino GIGA R1 WiFi; Tools > Port: the GIGA's port
+  - Meant for the modified PR 1292 shield (pins below). The old shields cannot be driven by this version.
+
+UPLOAD
+  1. File > Open: 2A13_BACKLIGHT_CONTROLLER_GIGA.ino
+  2. Tools > Target core: Main Core
+  3. Upload. Nothing else to upload.
+
+PIN LAYOUT (physical Giga pins; the J21 pad each net is on is in brackets)
+  Chan 1 D4 (PJ8, J19)        Chan 6  D28 (PJ15, pad 27)
+  Chan 2 D22 (PJ12, pad 33)   Chan 7  D31 (PJ3, pad 26)
+  Chan 3 D25 (PJ0, pad 32)    Chan 8  D35 (PJ5, pad 22)
+  Chan 4 D27 (PJ1, pad 30)    Chan 9  D37 (PJ6, pad 20)
+  Chan 5 D26 (PJ14, pad 29)   Chan 10 D38 (PJ7, pad 17)
+  Net names on the buffer side of the board may still show the old D numbers: the PHYSICAL pad decides.
+  Encoder (J14): pin 3 D50 = DT (PI11), pin 4 D48 = CLK (PK0), pin 5 D46 = push (PH15)   (confirmed by the board designer)
+  Temp LED D39 | fan PWM J13 D32, J12 D30 (plain outputs, held high) | fan tach J13 D5, J12 D3 | temp sensor SDA/SCL
+  RS485 (THVD1410): D0 RX, D1 TX, D2 DE+RE. Reserved; not driven by this sketch yet.
+  Port J pins accepted: D25 D26 D27 D28 D29 D31 D33 D35 D37 D38 D4 D11 D12 D22. Anything else is refused (fault 6).
+  If the encoder turns out reversed, swap encA and encB in the .ino.
+
+CHECK IT WORKED (onboard LED)
+  Flashing blue = no DCS-BIOS data | Solid green = DCS-BIOS data arriving | Solid magenta = manual / rainbow mode
+  Red flashing = LED output fault: N fast flashes, then a pause:
+      1 timer TIM3 already running   2 timer clock not sane   3 timing does not fit
+      4 a DMA1 stream 0..2 in use    5 frame buffer not DMA-reachable   6 a channel pin is not on port J
+      7 a channel has more than 405 LEDs   8 a frame was refused or failed (it is resent)
+
+WHAT HAS BEEN TESTED
+  The engine and glue on a bare Giga (27 Oct): start-up, 79 frames/s of rainbow for 18 minutes with 0 failed frames, stalls or DMA
+  errors, mode switching, solid green with DCS-BIOS connected; and on a bare Giga with a pin checker, ten port J pins, six data
+  patterns, 0 bit errors in hundreds of millions of pulses (with the earlier pin set D25..D38).
+  On a PC: the glue with the pins of this layout (3 frames, 83,760 pin-bits, 0 errors; D24 refused).
+  NOT tested: these ten pins on a Giga (GigaDMA1Port_M7only_pr1292 is the same proven bench with these pins), the shield with strips
+  (colour order, 120 ohm series resistors, level shifters), the encoder on the real board, anything on the RS485 bus.
+
+OPEN POINTS ON THE BOARD (not software)
+  - J1 (power): +5 V and +12 V swapped on pins 3 and 5 compared with the PR. Check it is intended.
+  - Buffer-side net names / schematic should be updated to the physical pins.
+  - RS485 chip and LED buffers share one VCC (5 V or 3.3 V jumper): on 5 V the RS485 receiver output likely reaches D0 at 5 V.
+  - Data-line series resistors: 120 ohm in the board file, 33 ohm in the BOM.
+  - Fan PWM on D30 / D32: not checked whether the core can do PWM there (held high here).
